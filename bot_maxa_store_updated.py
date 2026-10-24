@@ -1,0 +1,530 @@
+import asyncio
+import logging
+import os
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup, Message
+
+TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = Path(os.getenv("DB_PATH", "maxa_store.db"))
+ADMIN_IDS = {389330780}
+logging.basicConfig(level=logging.INFO)
+dp = Dispatcher()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=20000")
+    conn.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS support_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.execute('CREATE TABLE IF NOT EXISTS apps (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT "", url TEXT NOT NULL, created_at TEXT NOT NULL)')
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(apps)")}
+    for col, ddl in [("status", "TEXT NOT NULL DEFAULT 'published'"), ("photo_id", "TEXT"), ("views", "INTEGER NOT NULL DEFAULT 0"), ("clicks", "INTEGER NOT NULL DEFAULT 0")]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE apps ADD COLUMN {col} {ddl}")
+    conn.commit()
+    return conn
+
+
+def keyboard(rows):
+    return Markup(inline_keyboard=[[Button(text=label, callback_data=data) for label, data in row] for row in rows])
+
+
+def menu():
+    return keyboard([[("📱 Каталог", "catalog"), ("📲 Мои устройства", "devices")],
+                     [("💎 Подписка", "subscription"), ("🛟 Поддержка", "support")]])
+
+
+def admin_menu():
+    return keyboard([[("➕ Добавить", "adm_add"), ("📱 Приложения", "adm_apps")],
+                     [("📊 Статистика", "adm_stats"), ("📢 Рассылка", "adm_broadcast")],
+                     [("🛡 Модерация", "adm_moderation"), ("🛟 Обращения", "adm_support")],
+                     [("👥 Пользователи", "adm_users"), ("← Главное меню", "home")]])
+
+
+def is_admin(user):
+    return bool(user and user.id in ADMIN_IDS)
+
+
+def valid_url(url):
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.hostname) and len(url) <= 1000
+    except ValueError:
+        return False
+
+
+class AppWizard(StatesGroup):
+    name = State()
+    description = State()
+    url = State()
+    photo = State()
+    edit_value = State()
+    broadcast = State()
+
+
+def app_row(app_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
+
+
+def app_buttons(app_id):
+    return keyboard([[("✏️ Название", f"edit:{app_id}:name"), ("✏️ Описание", f"edit:{app_id}:description")],
+                     [("🔗 Ссылка", f"edit:{app_id}:url"), ("🖼 Иконка", f"edit:{app_id}:photo_id")],
+                     [("🌐 Публикация", f"toggle:{app_id}"), ("🗑 Удалить", f"delete:{app_id}")],
+                     [("← Приложения", "adm_apps")]])
+
+
+def app_info(app):
+    return (f"#{app['id']} {app['name']}\n\n{app['description']}\n\n{app['url']}\n\n"
+            f"Статус: {app['status']}\nПросмотры: {app['views']} · Переходы: {app['clicks']}")
+
+
+async def safe_edit(call, text, markup):
+    try:
+        await call.message.edit_text(text[:4000], reply_markup=markup)
+    except Exception:
+        await call.message.answer(text[:4000], reply_markup=markup)
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    u = message.from_user
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO users(telegram_id,username,created_at) VALUES(?,?,?)",
+                     (u.id, u.username, now()))
+        conn.execute("UPDATE users SET username=? WHERE telegram_id=?", (u.username, u.id))
+    await message.answer("🚀 Добро пожаловать в MAXA Store!\n\nВыберите раздел:", reply_markup=menu())
+
+
+@dp.message(Command("admin"))
+async def admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    await state.clear()
+    await message.answer("⚙️ Панель администратора MAXA Store", reply_markup=admin_menu())
+
+
+@dp.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=admin_menu() if is_admin(message.from_user) else menu())
+
+
+@dp.callback_query(F.data == "adm_home")
+async def admin_home(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await safe_edit(call, "⚙️ Панель администратора MAXA Store", admin_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_add")
+async def add_begin(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AppWizard.name)
+    await call.message.answer("➕ Новое приложение · шаг 1/4\nВведите название (до 100 символов).\n/cancel — отмена")
+    await call.answer()
+
+
+@dp.message(AppWizard.name)
+async def add_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    value = (message.text or "").strip()
+    if not 1 <= len(value) <= 100:
+        await message.answer("Введите название от 1 до 100 символов.")
+        return
+    await state.update_data(name=value)
+    await state.set_state(AppWizard.description)
+    await message.answer("Шаг 2/4 · Введите описание (до 500 символов).")
+
+
+@dp.message(AppWizard.description)
+async def add_description(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    value = (message.text or "").strip()
+    if not 1 <= len(value) <= 500:
+        await message.answer("Введите описание от 1 до 500 символов.")
+        return
+    await state.update_data(description=value)
+    await state.set_state(AppWizard.url)
+    await message.answer("Шаг 3/4 · Отправьте ссылку на приложение (https://...).")
+
+
+@dp.message(AppWizard.url)
+async def add_url(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    value = (message.text or "").strip()
+    if not valid_url(value):
+        await message.answer("Нужна корректная ссылка http:// или https://.")
+        return
+    await state.update_data(url=value)
+    await state.set_state(AppWizard.photo)
+    await message.answer("Шаг 4/4 · Пришлите изображение приложения или напишите «пропустить».")
+
+
+@dp.message(AppWizard.photo)
+async def add_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    elif (message.text or "").strip().lower() in ("пропустить", "skip", "-"):
+        photo_id = None
+    else:
+        await message.answer("Пришлите фотографию или напишите «пропустить».")
+        return
+    data = await state.get_data()
+    with db() as conn:
+        cursor = conn.execute(
+            "INSERT INTO apps(name,description,url,created_at,status,photo_id) VALUES(?,?,?,?,?,?)",
+            (data["name"], data["description"], data["url"], now(), "draft", photo_id))
+        app_id = cursor.lastrowid
+    await state.clear()
+    await message.answer(f"✅ Приложение #{app_id} сохранено как черновик. Опубликуйте после проверки прав на распространение.",
+                         reply_markup=app_buttons(app_id))
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def edit_begin(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        _, id_text, field = call.data.split(":")
+        app_id = int(id_text)
+    except (ValueError, AttributeError):
+        await call.answer("Некорректные данные")
+        return
+    if field not in ("name", "description", "url", "photo_id") or not app_row(app_id):
+        await call.answer("Приложение не найдено", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(app_id=app_id, field=field)
+    await state.set_state(AppWizard.edit_value)
+    prompt = "Отправьте новое изображение" if field == "photo_id" else f"Введите новое значение поля «{field}»"
+    await call.message.answer(f"✏️ #{app_id}: {prompt}.\n/cancel — отмена")
+    await call.answer()
+
+
+@dp.message(AppWizard.edit_value)
+async def edit_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    data = await state.get_data()
+    field, app_id = data["field"], data["app_id"]
+    if field == "photo_id":
+        if not message.photo:
+            await message.answer("Пришлите фотографию.")
+            return
+        value = message.photo[-1].file_id
+    else:
+        value = (message.text or "").strip()
+        max_length = {"name": 100, "description": 500, "url": 1000}[field]
+        if not 1 <= len(value) <= max_length or (field == "url" and not valid_url(value)):
+            await message.answer("Проверьте длину текста и формат ссылки.")
+            return
+    with db() as conn:
+        conn.execute(f"UPDATE apps SET {field}=? WHERE id=?", (value, app_id))
+    await state.clear()
+    await message.answer("✅ Изменения сохранены.", reply_markup=app_buttons(app_id))
+
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def toggle(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    app_id = int(call.data.split(":")[1])
+    app = app_row(app_id)
+    if not app:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    status = "draft" if app["status"] == "published" else "published"
+    with db() as conn:
+        conn.execute("UPDATE apps SET status=? WHERE id=?", (status, app_id))
+    await safe_edit(call, app_info(app_row(app_id)), app_buttons(app_id))
+    await call.answer("Опубликовано" if status == "published" else "Скрыто")
+
+
+@dp.callback_query(F.data.startswith("delete:"))
+async def delete_confirm(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    app_id = int(call.data.split(":")[1])
+    await safe_edit(call, f"Удалить приложение #{app_id}? Это действие необратимо.",
+                    keyboard([[("🗑 Да, удалить", f"deleteyes:{app_id}"), ("Отмена", f"app:{app_id}")]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("deleteyes:"))
+async def delete_yes(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    app_id = int(call.data.split(":")[1])
+    with db() as conn:
+        conn.execute("DELETE FROM apps WHERE id=?", (app_id,))
+    await safe_edit(call, "✅ Приложение удалено.", keyboard([[("← Приложения", "adm_apps")]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("app:"))
+async def admin_app(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    app_id = int(call.data.split(":")[1])
+    app = app_row(app_id)
+    if not app:
+        await call.answer("Не найдено", show_alert=True)
+        return
+    await safe_edit(call, app_info(app), app_buttons(app_id))
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"adm_apps", "adm_moderation", "adm_stats", "adm_support", "adm_users"}))
+async def admin_nav(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    with db() as conn:
+        if call.data == "adm_stats":
+            users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            published = conn.execute("SELECT COUNT(*) FROM apps WHERE status='published'").fetchone()[0]
+            drafts = conn.execute("SELECT COUNT(*) FROM apps WHERE status!='published'").fetchone()[0]
+            views, clicks = conn.execute("SELECT COALESCE(SUM(views),0),COALESCE(SUM(clicks),0) FROM apps").fetchone()
+            support = conn.execute("SELECT COUNT(*) FROM support_requests").fetchone()[0]
+            text = f"📊 Статистика\n\nПользователи: {users}\nОпубликовано: {published}\nЧерновики: {drafts}\nПросмотры карточек: {views}\nПереходы: {clicks}\nОбращения: {support}"
+            markup = keyboard([[("← Админ-панель", "adm_home")]])
+        elif call.data in ("adm_apps", "adm_moderation"):
+            where = "WHERE status!='published'" if call.data == "adm_moderation" else ""
+            apps = conn.execute(f"SELECT id,name,status FROM apps {where} ORDER BY id DESC LIMIT 40").fetchall()
+            text = "🛡 Модерация" if where else "📱 Управление приложениями"
+            text += "\nВыберите приложение:"
+            rows = [[(f"#{a['id']} {a['name'][:38]} {'✅' if a['status']=='published' else '🕒'}", f"app:{a['id']}")] for a in apps]
+            rows += [[("➕ Добавить", "adm_add")], [("← Админ-панель", "adm_home")]]
+            markup = keyboard(rows)
+        elif call.data == "adm_support":
+            reqs = conn.execute("SELECT id,telegram_id,text FROM support_requests ORDER BY id DESC LIMIT 10").fetchall()
+            text = "🛟 Последние обращения\n\n" + ("\n\n".join(f"#{r['id']} от {r['telegram_id']}: {r['text'][:200]}" for r in reqs) or "Обращений нет.")
+            markup = keyboard([[("← Админ-панель", "adm_home")]])
+        else:
+            users = conn.execute("SELECT telegram_id,username FROM users ORDER BY created_at DESC LIMIT 20").fetchall()
+            text = "👥 Пользователи\n\n" + ("\n".join(f"{u['telegram_id']} — @{u['username']}" if u["username"] else str(u["telegram_id"]) for u in users) or "Пока нет.")
+            markup = keyboard([[("← Админ-панель", "adm_home")]])
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_broadcast")
+async def broadcast_begin(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AppWizard.broadcast)
+    await call.message.answer("📢 Отправьте текст рассылки (до 3500 символов).\n/cancel — отмена")
+    await call.answer()
+
+
+@dp.message(AppWizard.broadcast)
+async def broadcast_preview(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        return
+    text = (message.text or "").strip()
+    if not 1 <= len(text) <= 3500:
+        await message.answer("Нужен текст до 3500 символов.")
+        return
+    await state.update_data(broadcast_text=text)
+    await message.answer("📢 Предпросмотр:\n\n" + text,
+                         reply_markup=keyboard([[("✅ Отправить всем", "broadcast_send"), ("❌ Отмена", "broadcast_cancel")]]))
+
+
+@dp.callback_query(F.data == "broadcast_cancel")
+async def broadcast_cancel(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await safe_edit(call, "Рассылка отменена.", admin_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "broadcast_send")
+async def broadcast_send(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user) or await state.get_state() != AppWizard.broadcast.state:
+        await call.answer("Нет активной рассылки", show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get("broadcast_text")
+    if not text:
+        await call.answer("Сначала введите текст", show_alert=True)
+        return
+    await state.clear()
+    await call.answer("Рассылка запущена")
+    with db() as conn:
+        ids = [r[0] for r in conn.execute("SELECT telegram_id FROM users")]
+    success = failed = 0
+    for user_id in ids:
+        try:
+            await call.bot.send_message(user_id, text)
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+    await call.message.answer(f"📢 Рассылка завершена.\nДоставлено: {success}\nОшибок: {failed}", reply_markup=admin_menu())
+
+
+@dp.callback_query(F.data == "catalog")
+async def catalog(call: CallbackQuery):
+    with db() as conn:
+        apps = conn.execute("SELECT id,name FROM apps WHERE status='published' ORDER BY id DESC LIMIT 40").fetchall()
+    rows = [[(f"📱 {a['name'][:55]}", f"view:{a['id']}")] for a in apps]
+    rows.append([("← Главное меню", "home")])
+    await safe_edit(call, "📱 Каталог MAXA Store\n\nВыберите приложение:" if apps else "📱 Каталог пока пуст.", keyboard(rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("view:"))
+async def view_app(call: CallbackQuery):
+    app_id = int(call.data.split(":")[1])
+    with db() as conn:
+        app = conn.execute("SELECT * FROM apps WHERE id=? AND status='published'", (app_id,)).fetchone()
+        if app:
+            conn.execute("UPDATE apps SET views=views+1 WHERE id=?", (app_id,))
+    if not app:
+        await call.answer("Приложение недоступно", show_alert=True)
+        return
+    markup = keyboard([[("🔗 Открыть приложение", f"out:{app_id}")], [("← Каталог", "catalog")]])
+    await safe_edit(call, f"📱 {app['name']}\n\n{app['description']}", markup)
+    if app["photo_id"]:
+        try:
+            await call.message.answer_photo(app["photo_id"])
+        except Exception:
+            pass
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("out:"))
+async def out_app(call: CallbackQuery):
+    app_id = int(call.data.split(":")[1])
+    with db() as conn:
+        app = conn.execute("SELECT url FROM apps WHERE id=? AND status='published'", (app_id,)).fetchone()
+        if app:
+            conn.execute("UPDATE apps SET clicks=clicks+1 WHERE id=?", (app_id,))
+    if not app:
+        await call.answer("Приложение недоступно", show_alert=True)
+        return
+    # Callback buttons cannot dynamically redirect to a URL; provide a real URL button.
+    await call.message.answer("Открыть приложение:", reply_markup=Markup(inline_keyboard=[
+        [Button(text="🔗 Перейти", url=app["url"])]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.in_({"home", "devices", "subscription", "support"}))
+async def navigate(call: CallbackQuery):
+    screens = {
+        "home": ("🚀 MAXA Store\n\nВыберите раздел:", menu()),
+        "devices": ("📲 Мои устройства\n\nУ вас пока нет привязанных устройств.", keyboard([[("← Главное меню", "home")]])),
+        "subscription": ("💎 Подписка\n\nТарифы пока не подключены. Оплата недоступна.", keyboard([[("← Главное меню", "home")]])),
+        "support": ("🛟 Поддержка\n\nНапишите /support ваш вопрос.", keyboard([[("← Главное меню", "home")]])),
+    }
+    text, markup = screens[call.data]
+    await safe_edit(call, text, markup)
+    await call.answer()
+
+
+@dp.message(Command("support"))
+async def support(message: Message):
+    text = (message.text or "").partition(" ")[2].strip()
+    if not text:
+        await message.answer("Напишите: /support ваш вопрос")
+        return
+    if len(text) > 3500:
+        await message.answer("Сократите обращение до 3500 символов.")
+        return
+    with db() as conn:
+        conn.execute("INSERT INTO support_requests(telegram_id,text,created_at) VALUES(?,?,?)", (message.from_user.id, text, now()))
+    await message.answer("✅ Обращение сохранено. Ответы обрабатываются вручную.")
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.bot.send_message(admin_id, f"🛟 Новое обращение от {message.from_user.id}:\n\n{text}")
+        except Exception:
+            logging.exception("Cannot notify admin")
+
+
+@dp.message(Command("addapp"))
+async def legacy_add(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    parts = (message.text or "").partition(" ")[2].split("|")
+    if len(parts) != 3:
+        await message.answer("Формат: /addapp Название | Описание | https://example.com")
+        return
+    name, description, url = (p.strip() for p in parts)
+    if not 1 <= len(name) <= 100 or len(description) > 500 or not valid_url(url):
+        await message.answer("Проверьте название, описание и ссылку.")
+        return
+    with db() as conn:
+        cur = conn.execute("INSERT INTO apps(name,description,url,created_at,status) VALUES(?,?,?,?,?)",
+                           (name, description, url, now(), "draft"))
+    await message.answer(f"✅ Черновик #{cur.lastrowid} создан. Опубликуйте через /admin.")
+
+
+@dp.message(Command("delapp"))
+async def legacy_delete(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("⛔ Доступ запрещён.")
+        return
+    arg = (message.text or "").partition(" ")[2].strip()
+    if not arg.isdecimal() or not app_row(int(arg)):
+        await message.answer("Формат: /delapp ID (существующего приложения)")
+        return
+    await message.answer(f"Подтвердите удаление #{arg}:",
+                         reply_markup=keyboard([[("🗑 Удалить", f"deleteyes:{arg}"), ("Отмена", f"app:{arg}")]]))
+
+
+@dp.message()
+async def fallback(message: Message):
+    await message.answer("Откройте /start или /admin (для администратора). Поддержка: /support ваш вопрос.")
+
+
+async def main():
+    if not TOKEN:
+        raise RuntimeError("Set BOT_TOKEN environment variable")
+    db().close()
+    bot = Bot(token=TOKEN)
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
